@@ -1,230 +1,184 @@
-import asyncio
-import re
-import uuid
+import regex as regex_module
 import logging
-from .._grammar import grammar
-from .._utils import escape_template_block
+import guidance
+from ._silent import silent
+from .._grammar import select
+from ._zero_or_more import zero_or_more
+from .._grammar import commit_point
+from ._any_char import any_char
+from .._grammar import capture
+from ._regex import regex as regex_grammar
+from .._grammar import token_limit
+from .._grammar import with_temperature
+from .._grammar import model_variable
+from ._tool import Tool
+from ._block import block
 
-log = logging.getLogger(__name__)
+logger = logging.getLogger(__name__)
 
-async def gen(variable_name="generated", stop=None, stop_regex=None, max_tokens=500, n=1, temperature=0.0, top_p=1.0,
-              logprobs=None, pattern=None, hidden=False, parse=False, list_append=False, save_prompt=False,
-              token_healing=None, _parser_context=None):
-    ''' Use the LLM to generate a completion.
+# TODO: make this stateless!
+@guidance(stateless=lambda *args, **kwargs: kwargs.get("tools", None) is None) # TODO: uncomment this once we get temperature stateless
+def gen(lm, name=None, *, max_tokens=1000, list_append=False, regex=None,
+        tools=None, hide_tool_call=False, stop=None, stop_regex=None, suffix="", n=1, temperature=0.0, top_p=1.0,
+        stream_tokens=None, save_stop_text=False, **llm_kwargs):
+    """
+    TODO: document this
+    tools is a list of guidance.Tool or python functions (which will be converted to guidance.Tool)
+    """
+    logger.debug(f'start gen(name="{name}")')
 
-    Parameters
-    ----------
-    variable_name : str
-        The name of the variable to store the generated value in.
-    stop : str
-        The stop string to use for stopping generation. If not provided, the next node's text will be used if
-        that text matches a closing quote, XML tag, or role end. Note that the stop string is not included in
-        the generated value.
-    stop_regex : str
-        A regular expression to use for stopping generation. If not provided, the stop string will be used.
-    max_tokens : int
-        The maximum number of tokens to generate in this completion.
-    n : int
-        The number of completions to generate. If you generate more than one completion, the variable will be
-        set to a list of generated values. Only the first completion will be used for future context for the LLM,
-        but you may often want to use hidden=True when using n > 1.
-    temperature : float
-        The temperature to use for generation. A higher temperature will result in more random completions. Note
-        that caching is always on for temperature=0, and is seed-based for other temperatures.
-    top_p : float
-        The top_p value to use for generation. A higher top_p will result in more random completions.
-    logprobs : int or None
-        If set to an integer, the LLM will return that number of top log probabilities for the generated tokens
-        which will be stored in a variable named `variable_name+"_logprobs"`. If set to None, the log
-        probabilities will not be returned.
-    pattern : str or None
-        A regular expression pattern guide to use for generation. If set the LLM will be forced (through guided
-        decoding) to only generate completions that match the regular expression.
-    hidden : bool
-        Whether to hide the generated value from future LLM context. This is useful for generating completions
-        that you just want to save in a variable and not use for future context.
-    parse : bool
-        Whether to parse the generated value. If set to True, the generated value will be parsed as a guidance
-        program. Warning: This has not been tested for security yet, and needs to controls added to be safe. If
-        you need to use this, consider a PR to add the necessary security controls.
-    list_append : bool
-        Whether to append the generated value to a list stored in the variable. If set to True, the variable
-        must be a list, and the generated value will be appended to the list.
-    save_prompt : str or bool
-        If set to a string, the exact prompt given to the LLM will be saved in a variable with the given name.
-    token_healing : bool or None
-        If set to a bool this overrides the token_healing setting for the LLM.
-    '''
-    prefix = ""
-    suffix = ""
+    # set stream if we are interactive
+    # if stream_tokens is None and not lm.is_silent() and n == 1:
+    #     stream_tokens = True
 
-    # get the parser context variables we will need
-    parser = _parser_context['parser']
-    next_node = _parser_context["next_node"]
-    next_next_node = _parser_context["next_next_node"]
-    prev_node = _parser_context["prev_node"]
-    parser_prefix = _parser_context["parser_prefix"]
-    partial_output = _parser_context["partial_output"]
+    # use the suffix as the stop string if not otherwise specified
+    # TODO: still need to make suffix work with grammars
+    # eos_token = lm.eos_token.decode('utf8')
+    if stop is None and stop_regex is None and suffix != "":
+        stop = suffix
+    # if stop is None and stop_regex is None and getattr(lm, "suffix", False):
+    #     if lm.suffix.startswith("\n"):
+    #         stop = "\n"
+    #     elif lm.suffix.startswith('"') and str(lm).endswith('"'):
+    #         stop = '"'
+    #     elif lm.suffix.startswith("'") and str(lm).endswith("'"):
+    #         stop = "'"
 
-    # if stop is None then we use the text of the node after the generate command
-    if stop is None:
-
-        next_text = next_node.text if next_node is not None else ""
-        prev_text = prev_node.text if prev_node is not None else ""
-        if next_next_node and next_next_node.text.startswith("{{~"):
-            next_text = next_text.lstrip()
-            if next_next_node and next_text == "":
-                next_text = next_next_node.text
-
-        # auto-detect quote stop tokens
-        quote_types = ["'''", '"""', '```', '"', "'", "`"]
-        for quote_type in quote_types:
-            if next_text.startswith(quote_type) and prev_text.endswith(quote_type):
-                stop = quote_type
-                break
-
-        # auto-detect role stop tags
+    # fall back to stopping at the EOS token
+    if stop is not False:
         if stop is None:
-            m = re.match(r"^{{~?/(user|assistant|system|role)~?}}.*", next_text)
-            if m:
-                stop = parser.program.llm.role_end(m.group(1))
+            stop = []
+        if isinstance(stop, str):
+            stop = [stop]
+        if regex is None:
+            stop.append(model_variable('default_end_patterns'))
 
-        # auto-detect XML tag stop tokens
-        if stop is None:
-            m = re.match(r"<([^>\W]+)[^>]+>", next_text)
-            if m is not None:
-                end_tag = "</"+m.group(1)+">"
-                if next_text.startswith(end_tag):
-                    stop = end_tag
-        
-        # fall back to the next node's text
-        if stop is None:
-            stop = next_text
+        if stop_regex is None:
+            stop_regex = []
+        if isinstance(stop_regex, str):
+            stop_regex = [stop_regex]
+        stop_regex = [regex_grammar(x) for x in stop_regex]
 
-        
-        
-    if stop == "":
-        stop = None
-
-    # set the cache seed to 0 if temperature is 0
-    if temperature > 0:
-        cache_seed = parser.program.cache_seed
-        parser.program.cache_seed += 1
+    # This needs to be here for streaming
+    # if name is not None and not list_append:
+    #     lm[name] = ""
+    
+    # define the generation pattern
+    if regex is not None:
+        pattern = regex_grammar(regex)
     else:
-        cache_seed = 0
+        pattern = zero_or_more(any_char())
 
-    # see if we should stream the results
-    if n == 1: # we can't stream batches right now
-        if parser.program.stream == "auto":
-            stream_generation = not parser.program.silent or parser.program.async_mode
-        else:
-            stream_generation = parser.program.stream
+    tagged_name = "__LIST_APPEND:" + name if list_append and name is not None else name
+
+    # define any capture group for non-tool calls
+    if name is not None and tools is None:
+        pattern = capture(pattern, name=tagged_name)
+    
+    # limit the number of tokens
+    pattern = token_limit(pattern, max_tokens)
+    
+    # define the stop pattern
+    if stop is False or len(stop + stop_regex) == 0:
+        stop_pattern = ''
     else:
-        stream_generation = False
+        stop_pattern = select(stop + stop_regex)
+        if save_stop_text is True:
+            save_stop_text = str(name) + "_stop_text"
+        if isinstance(save_stop_text, str):
+            stop_pattern = capture(stop_pattern, name=save_stop_text)
+        stop_pattern = commit_point(stop_pattern, hidden=True)
 
-    # save the prompt if requested
-    if save_prompt:
-        parser.set_variable(save_prompt, parser_prefix+prefix)
+    # single generation
+    start_pos = len(str(lm))
+    if tools is not None:
+        with block(tagged_name):
+            tools = [Tool(callable=x) if not isinstance(x, Tool) else x for x in tools]
+            init_token_count = lm.token_count
+            gen_grammar = pattern + select([stop_pattern] + [capture(commit_point(x.call_grammar, hidden=hide_tool_call), name=f'tool{i}') for i, x in enumerate(tools)])
+            while lm.token_count <= max_tokens + init_token_count:
+                lm = lm._run_stateless(gen_grammar, temperature=temperature) # TODO: we should not be using this internal method
+                tool_called = False
+                for i in range(len(tools)):
+                    tool_i = f'tool{i}'
+                    if tool_i in lm:
+                        tool_called = True
+                        lm += tools[i].tool_call()
+                        lm = lm.remove(tool_i)
+                if not tool_called:
+                    lm += suffix
+                    break
+    elif n == 1:
+        lm += with_temperature(pattern + stop_pattern + suffix, temperature)
 
-    if logprobs is None:
-        logprobs = parser.program.logprobs
+    logger.debug(f'finish gen')
+    return lm
 
-    # call the LLM
-    gen_obj = await parser.llm_session(
-        parser_prefix+prefix, stop=stop, stop_regex=stop_regex, max_tokens=max_tokens, n=n, pattern=pattern,
-        temperature=temperature, top_p=top_p, logprobs=logprobs, cache_seed=cache_seed, token_healing=token_healing,
-        echo=parser.program.logprobs is not None, stream=stream_generation, caching=parser.program.caching
-    )
 
-    if n == 1:
-        generated_value = prefix
-        partial_output(prefix)
-        logprobs_out = []
-        if not stream_generation:
-            gen_obj = [gen_obj]
-        if list_append:
-            value_list = parser.get_variable(variable_name, [])
-            value_list.append("")
-            if logprobs is not None:
-                logprobs_list = parser.get_variable(variable_name+"_logprobs", [])
-                logprobs_list.append([])
-        for resp in gen_obj:
-            await asyncio.sleep(0) # allow other tasks to run
-            #log("parser.should_stop = " + str(parser.should_stop))
-            if parser.should_stop:
-                #log("Stopping generation")
-                break
-            # log.debug("resp", resp)
-            generated_value += resp["choices"][0]["text"]
-            partial_output(resp["choices"][0]["text"])
-            if logprobs is not None:
-                logprobs_out.extend(resp["choices"][0]["logprobs"])
-            if list_append:
-                value_list[-1] = generated_value
-                parser.set_variable(variable_name, value_list)
-                if logprobs is not None:
-                    logprobs_list[-1] = logprobs_out
-                    parser.set_variable(variable_name+"_logprobs", logprobs_list)
-            else:
-                parser.set_variable(variable_name, generated_value)
-                if logprobs is not None:
-                    parser.set_variable(variable_name+"_logprobs", logprobs_out)
-        if hasattr(gen_obj, 'close'):
-            gen_obj.close()
-        generated_value += suffix
-        partial_output(suffix)
-        if list_append:
-            value_list[-1] = generated_value
-            parser.set_variable(variable_name, value_list)
-        else:
-            parser.set_variable(variable_name, generated_value)
-        
-        if parse:
-            assert not hidden, "Cannot parse generated text if we are hiding the output" # TODO: fix this?
-            subtree = grammar.parse(generated_value)
-            return await parser.visit(subtree)
-        else:
-            # stop executing if we were interrupted
-            if parser.should_stop:
-                parser.executing = False
-                parser.should_stop = False
-            return
-    else:
-        assert not isinstance(gen_obj, list), "Streaming is only supported for n=1"
-        generated_values = [prefix+choice["text"]+suffix for choice in gen_obj["choices"]]
-        if list_append:
-            value_list = parser.get_variable(variable_name, [])
-            value_list.append(generated_values)
-            if logprobs is not None:
-                logprobs_list = parser.get_variable(variable_name+"_logprobs", [])
-                logprobs_list.append([choice["logprobs"] for choice in gen_obj["choices"]])
-        else:
-            parser.set_variable(variable_name, generated_values)
-            if logprobs is not None:
-                parser.set_variable(variable_name+"_logprobs", [choice["logprobs"] for choice in gen_obj["choices"]])
+def click_loop_start(id, total_count, echo, color):
+    click_script = '''
+function cycle_IDVAL(button_el) {
+var i = 0;
+while (i < 50) {
+var el = document.getElementById("IDVAL_" + i);
+if (el.style.display == "inline") {
+    el.style.display = "none";
+    var next_el = document.getElementById("IDVAL_" + (i+1));
+    if (!next_el) {
+        next_el = document.getElementById("IDVAL_0");
+    }
+    if (next_el) {
+        next_el.style.display = "inline";
+    }
+    break;
+}
+i += 1;
+}
+button_el.innerHTML = (((i+1) % TOTALCOUNT) + 1)  + "/" + TOTALCOUNT;
+}
+cycle_IDVAL(this);'''.replace("IDVAL", id).replace("TOTALCOUNT", str(total_count)).replace("\n", "")
+    out = f'''<div style='background: rgba(255, 255, 255, 0.0); border-radius: 4px 0px 0px 4px; border: 1px solid {color}; border-right: 0px; padding-left: 3px; padding-right: 3px; user-select: none; color: {color}; display: inline; font-weight: normal; cursor: pointer' onClick='{click_script}'>1/{total_count}</div>'''
+    out += f"<div style='display: inline;' id='{id}_0'>"
+    return "<||_html:" + out + "_||>"
 
-        if not hidden:
-            # TODO: we could enable the parsing to branch into multiple paths here, but for now we just complete the program with the first prefix
-            generated_value = generated_values[0]
+def click_loop_mid(id, index, echo):
+    alpha = 1.0 if not echo else 0.5
+    out = f"</div><div style='display: none; opacity: {alpha}' id='{id}_{index}'>"
+    return "<||_html:" + out + "_||>"
 
-            # echoing with multiple completions is not standard behavior
-            # this just uses the first generated value for completion and the rest as alternatives only used for the variable storage
-            # we mostly support this so that the echo=False hiding behavior does not make multiple outputs more complicated than it needs to be in the UX
-            # if echo:
-            #     partial_output(generated_value) 
-            
-            id = uuid.uuid4().hex
-            l = len(generated_values)
-            out = "{{!--" + f"GMARKERmany_generate_start_{not hidden}_{l}${id}$" + "--}}"
-            for i, value in enumerate(generated_values):
-                if i > 1:
-                    out += "--}}"
-                if i > 0:
-                    out += "{{!--" + f"GMARKERmany_generate_{not hidden}_{i}${id}$" + "--}}{{!--G "
-                    out += escape_template_block(value)
-                else:
-                    out += value
-            partial_output(out + "--}}{{!--" + f"GMARKERmany_generate_end${id}$" + "--}}")
-            return
-            # return "{{!--GMARKERmany_generate_start$$}}" + "{{!--GMARKERmany_generate$$}}".join([v for v in generated_values]) + "{{!--GMARKERmany_generate_end$$}}"
-            # return "".join([v for v in generated_values])
+@guidance
+def gen_line(lm, *args, **kwargs):
+    return lm.gen(*args, suffix='\n', **kwargs)
+
+@guidance
+def gen_quote(lm, name=None, quote='"', *args, **kwargs):
+    return lm(quote).gen(*args,name=name, suffix=quote, **kwargs)
+
+@guidance
+def will_gen(lm, stop=None, stop_regex=None, ignore_spaces=False, max_tokens=30):
+    # this is obviously not the right implementation, just here so we can explore
+    if stop and not isinstance(stop, list):
+        stop = [stop]
+    if stop_regex and not isinstance(stop_regex, list):
+        stop_regex = [stop_regex]
+    assert (stop is not None) or (stop_regex is not None)
+    if not stop:
+        stop = []
+    if not stop_regex:
+        stop_regex = []
+    regexes = [regex_module.escape(x) for x in stop + stop_regex]
+    optional_space = '\\s*' if ignore_spaces else ''
+    pattern = regex_module.compile(f'{optional_space}({"|".join(regexes)})')
+    lm2 = lm
+    with silent():
+        for _ in range(max_tokens):
+            lm2 += gen('temp_variable', list_append=True, max_tokens=1)
+            if not lm2['temp_variable'] or not pattern.match(''.join(lm2['temp_variable']), partial=True):
+                return False
+            if pattern.match(''.join(lm2['temp_variable']), partial=False):
+                return True
+    return False
+
+@guidance
+def call_tool(lm, tool):
+    return lm + tool.call_grammar + tool.tool_call()

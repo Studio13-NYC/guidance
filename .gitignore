@@ -1,6 +1,7 @@
 notebooks/local_scratch
 __pycache__/
 .vscode
+.vs
 /build
 /dist
 *.egg-info
@@ -8,3 +9,8 @@ __pycache__/
 .ipynb_checkpoints
 node_modules
 /client
+.eggs/
+.env
+
+# Ignore native library built by setup
+guidance/*.so
